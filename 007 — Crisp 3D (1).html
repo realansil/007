@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>007 — Crisp 3D</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#fff;overscroll-behavior:none;
+    -webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  #stage{position:fixed;inset:0;touch-action:none}
+  canvas{display:block;width:100%;height:100%;outline:none;touch-action:none;cursor:crosshair}
+  .hud{position:fixed;left:0;right:0;pointer-events:none;font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+    color:rgba(255,255,255,.55);transition:opacity .5s}
+  body.hud-off .hud{opacity:0}
+  #top{top:calc(14px + env(safe-area-inset-top));padding:0 calc(16px + env(safe-area-inset-right)) 0 calc(16px + env(safe-area-inset-left));
+    display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+  #meter{min-width:120px}
+  #bar{height:1px;margin-top:7px;background:rgba(255,255,255,.14);position:relative;overflow:hidden}
+  #bar i{position:absolute;inset:0;background:#fff;transform-origin:left;transform:scaleX(1);transition:transform .25s}
+  #btns{display:flex;gap:8px;pointer-events:auto}
+  .btn{font:inherit;letter-spacing:inherit;text-transform:inherit;color:rgba(255,255,255,.8);background:rgba(255,255,255,.04);
+    border:1px solid rgba(255,255,255,.22);border-radius:999px;padding:9px 14px;min-height:36px;cursor:pointer;
+    transition:opacity .2s,background .2s,border-color .2s}
+  .btn:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.45)}
+  .btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
+  .btn[disabled]{opacity:.3;pointer-events:none}
+  .btn[aria-pressed="false"]{opacity:.5}
+  #hint{bottom:calc(20px + env(safe-area-inset-bottom));text-align:center;padding:0 16px;opacity:0}
+  #hint.show{opacity:1}
+  #loading{position:fixed;inset:0;display:grid;place-items:center;font-size:11px;letter-spacing:.3em;text-transform:uppercase;
+    color:rgba(255,255,255,.5);pointer-events:none;transition:opacity .8s}
+  #loading.hide{opacity:0}
+  @media (prefers-reduced-motion: reduce){ .hud,#loading,.btn,#bar i{transition:none} }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.168.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.168.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+<div id="loading" role="status">assembling</div>
+<div id="top" class="hud">
+  <div id="meter"><span id="integrity">integrity 100%</span><div id="bar"><i id="barfill"></i></div></div>
+  <div id="btns">
+    <button class="btn" id="btn-snd" aria-pressed="true" aria-label="Toggle sound">sound</button>
+    <button class="btn" id="btn-rebuild" aria-label="Rebuild the logo" disabled>rebuild</button>
+  </div>
+</div>
+<div id="hint" class="hud">drag across it to shatter &nbsp;·&nbsp; tap empty space to rebuild</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+/* ───────────── helpers ───────────── */
+const $ = (id) => document.getElementById(id);
+const stage = $('stage'), elIntegrity = $('integrity'), elBarFill = $('barfill'), elHint = $('hint'),
+      elLoading = $('loading'), btnSnd = $('btn-snd'), btnRebuild = $('btn-rebuild');
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const rnd = (a = 0, b = 1) => a + Math.random() * (b - a);
+const easeOutQuart = (t) => 1 - Math.pow(1 - t, 4);
+const easeInOutCubic = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const nextFrame = () => new Promise((r) => setTimeout(r, 0));
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const coarse = matchMedia('(pointer: coarse)').matches;
+
+function fatal(msg) {
+  elLoading.textContent = msg;
+  elLoading.classList.remove('hide');
+  throw new Error(msg);
+}
+
+/* Optional robust 2D boolean ops for real fracture. If the CDN is blocked, parts simply break off whole. */
+let polyClip = null;
+try {
+  polyClip = (await import('https://cdn.jsdelivr.net/npm/polygon-clipping@0.15.7/+esm')).default;
+} catch (err) {
+  console.warn('[007] polygon-clipping unavailable; falling back to whole-part breakage.', err);
+}
+
+/* ───────────── renderer / scene / camera ───────────── */
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
+} catch (err) { fatal('WebGL is not available on this device'); }
+
+const MAX_DPR = 2;
+let quality = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+renderer.setPixelRatio(quality);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.NeutralToneMapping;   // keeps whites white instead of greying them out
+renderer.toneMappingExposure = 1.0;
+stage.appendChild(renderer.domElement);
+renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+renderer.domElement.addEventListener('webglcontextlost', (e) => { e.preventDefault(); elLoading.textContent = 'graphics context lost — reload'; elLoading.classList.remove('hide'); });
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.55;
+
+const camera = new THREE.PerspectiveCamera(36, window.innerWidth / window.innerHeight, 0.1, 250);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.enablePan = false;
+controls.minDistance = 5;
+controls.minPolarAngle = 0.25;
+controls.maxPolarAngle = Math.PI * 0.5 + 0.1;   // never dips under the floor
+controls.target.set(0, -0.15, 0);
+
+let WALL_X = 8;
+function getResponsiveDistance() {
+  const aspect = window.innerWidth / Math.max(window.innerHeight, 1);
+  const vHalf = THREE.MathUtils.degToRad(camera.fov) / 2;
+  const hHalf = Math.atan(Math.tan(vHalf) * aspect);
+  const dW = (10.8 / 2) / Math.tan(hHalf);
+  const dH = (6.6 / 2) / Math.tan(vHalf);
+  return Math.max(dW, dH, 11.5) * 1.08;
+}
+function applyResponsiveCamera(preserveDirection) {
+  const dist = getResponsiveDistance();
+  const dir = new THREE.Vector3(0.1, 0.12, 1).normalize();
+  if (preserveDirection) {
+    const d = camera.position.clone().sub(controls.target);
+    if (d.lengthSq() > 1e-4) dir.copy(d).normalize();
+  }
+  camera.position.copy(controls.target).addScaledVector(dir, dist);
+  camera.aspect = window.innerWidth / Math.max(window.innerHeight, 1);
+  camera.updateProjectionMatrix();
+  controls.maxDistance = Math.max(40, dist * 2.2);
+  const hHalf = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * camera.aspect);
+  WALL_X = clamp(dist * Math.tan(hHalf) * 0.92, 5.6, 16);
+}
+applyResponsiveCamera(false);
+
+/* ───────────── post-processing ───────────── */
+const rt = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: coarse ? 2 : 4 });
+const composer = new EffectComposer(renderer, rt);
+composer.setPixelRatio(quality);
+composer.setSize(window.innerWidth, window.innerHeight);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.12, 0.35, 1.9);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+/* ───────────── lighting ───────────── */
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
+keyLight.position.set(6, 10, 12);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.set(coarse ? 1024 : 2048, coarse ? 1024 : 2048);
+Object.assign(keyLight.shadow.camera, { left: -9, right: 9, top: 7, bottom: -7, near: 2, far: 40 });
+keyLight.shadow.bias = -0.0004;
+keyLight.shadow.normalBias = 0.02;
+keyLight.shadow.radius = 3;
+scene.add(keyLight);
+
+const rimL = new THREE.DirectionalLight(0xe8f0ff, 1.0); rimL.position.set(-12, 6, -9); scene.add(rimL);
+const rimR = new THREE.DirectionalLight(0xffffff, 0.8);  rimR.position.set(11, -2, -10); scene.add(rimR);
+const fill = new THREE.DirectionalLight(0xffffff, 0.25); fill.position.set(-4, -6, 9); scene.add(fill);
+
+/* ───────────── floor (soft pool of light that catches shards and shadows) ───────────── */
+const FLOOR = -2.45;
+const GRAV = 17;
+function radialTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const gr = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.35, '#555555'); gr.addColorStop(0.75, '#000000'); gr.addColorStop(1, '#000000');
+  g.fillStyle = gr; g.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(c);
+}
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(30, 30),
+  new THREE.MeshStandardMaterial({ color: 0x0c0c0f, roughness: 0.4, metalness: 0.2, transparent: true,
+                                   alphaMap: radialTexture(), depthWrite: false })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = FLOOR;
+floor.receiveShadow = true;
+floor.renderOrder = -1;
+scene.add(floor);
+
+const assembly = new THREE.Group();
+scene.add(assembly);
+
+/* ───────────── logo contours (traced from the reference image) ───────────── */
+const LOGO_PARTS = [{"area": 110294, "outer": [[-3.1734, 1.521], [-3.3227, 1.5707], [-3.6283, 1.5707], [-3.7989, 1.521], [-4.005, 1.4215], [-4.2822, 1.2011], [-4.4883, 0.9737], [-4.666, 0.7107], [-4.8081, 0.4335], [-4.9289, 0.1066], [-4.9929, -0.199], [-5.0, -0.6254], [-4.9858, -0.7534], [-4.9218, -1.0377], [-4.8081, -1.2722], [-4.666, -1.4286], [-4.4741, -1.5423], [-4.3248, -1.5778], [-4.0334, -1.5707], [-3.8202, -1.5139], [-3.5501, -1.3717], [-3.4222, -1.2722], [-3.2018, -1.0377], [-3.0597, -0.8387], [-2.8891, -0.5117], [-2.7754, -0.2061], [-2.6972, 0.1137], [-2.6688, 0.4051], [-2.6901, 0.8173], [-2.7541, 1.0519], [-2.8394, 1.2296], [-3.0171, 1.4286]], "holes": [[[-3.3582, 1.2509], [-3.3085, 1.194], [-3.28, 1.0661], [-3.28, 0.9168], [-3.3085, 0.6539], [-3.3937, 0.2772], [-3.5359, -0.1208], [-3.7349, -0.5473], [-3.9837, -0.9595], [-4.076, -1.0803], [-4.2182, -1.2011], [-4.2893, -1.2367], [-4.3746, -1.2367], [-4.4243, -1.194], [-4.4598, -1.0803], [-4.4456, -0.7818], [-4.3106, -0.3198], [-4.2893, -0.2914], [-4.0832, 0.2914], [-3.8486, 0.796], [-3.6425, 1.1087], [-3.5217, 1.2225], [-3.4293, 1.258]]]}, {"area": 110376, "outer": [[-0.8209, 1.5423], [-0.9844, 1.5778], [-1.226, 1.5707], [-1.4463, 1.4996], [-1.6311, 1.4001], [-1.823, 1.2509], [-2.0291, 1.0377], [-2.2566, 0.7178], [-2.4058, 0.4264], [-2.5267, 0.0853], [-2.5906, -0.263], [-2.5906, -0.6468], [-2.5622, -0.8742], [-2.5053, -1.0661], [-2.3632, -1.322], [-2.2637, -1.4286], [-2.0718, -1.5423], [-1.9225, -1.5778], [-1.5885, -1.5636], [-1.3397, -1.4854], [-1.1336, -1.3646], [-0.9986, -1.258], [-0.764, -1.0021], [-0.5721, -0.7036], [-0.4513, -0.4478], [-0.3376, -0.1066], [-0.2807, 0.1777], [-0.2594, 0.4122], [-0.2807, 0.8102], [-0.366, 1.1016], [-0.4869, 1.3077], [-0.6574, 1.4641]], "holes": [[[-0.9417, 1.2438], [-0.892, 1.1727], [-0.8706, 1.0519], [-0.892, 0.7249], [-0.9559, 0.4051], [-1.0981, -0.0355], [-1.3184, -0.5259], [-1.4606, -0.7818], [-1.6027, -0.995], [-1.823, -1.2082], [-1.887, -1.2367], [-1.9794, -1.2296], [-2.0362, -1.1656], [-2.0576, -0.9666], [-2.0362, -0.7534], [-1.9225, -0.3696], [-1.8941, -0.3198], [-1.752, 0.1066], [-1.7235, 0.1493], [-1.7235, 0.1848], [-1.489, 0.7036], [-1.29, 1.0377], [-1.226, 1.1158], [-1.0981, 1.2296], [-1.0341, 1.258]]]}, {"area": 65320, "outer": [[2.2281, 1.5423], [0.1315, 1.5423], [0.0533, 1.4072], [-0.0675, 1.123], [-0.2026, 0.7107], [-0.1955, 0.6752], [0.2381, 0.6823], [0.4513, 1.1301], [1.3966, 1.1301], [1.4108, 1.0732], [1.29, 0.8316], [1.0981, 0.5544], [0.3589, -0.3412], [0.1315, -0.661], [-0.0746, -1.0306], [-0.2026, -1.3362], [-0.2452, -1.5139], [0.5437, -1.521], [0.5721, -1.4996], [0.6361, -1.2935], [0.7214, -1.1016], [0.9417, -0.7107], [1.1763, -0.3767], [1.7804, 0.3696], [2.022, 0.7534], [2.1144, 0.9453], [2.1997, 1.2011], [2.2281, 1.3646]], "holes": []}, {"area": 16402, "outer": [[1.489, -0.2772], [2.3419, -0.2772], [2.5267, -0.263], [2.6262, -0.2274], [2.747, -0.1493], [2.8252, -0.0498], [3.1663, 0.5046], [3.3085, 0.5899], [3.4932, 0.6183], [3.5501, 0.6468], [3.678, 0.7463], [3.6994, 0.7818], [3.6923, 0.8031], [2.2139, 0.8031], [2.1784, 0.7676], [2.1215, 0.6183], [2.1215, 0.398], [2.2139, 0.2203], [2.3205, 0.1279], [2.3561, 0.135], [2.3205, 0.3127], [2.3419, 0.4193], [2.3845, 0.5046], [2.8323, 0.5046], [2.8465, 0.4904], [2.7683, 0.2914], [2.6475, 0.064], [2.548, -0.0426], [2.3987, -0.1066], [1.6098, -0.1066], [1.489, -0.2345]], "holes": []}, {"area": 28498, "outer": [[2.2708, 0.9524], [2.2779, 0.9311], [3.8131, 0.9311], [3.9055, 1.0306], [4.0121, 1.0803], [4.7797, 1.0803], [4.9005, 1.1869], [4.9574, 1.2722], [5.0, 1.4001], [4.9929, 1.5423], [2.42, 1.5494], [2.4058, 1.5423], [2.3774, 1.2367], [2.349, 1.1158]], "holes": []}];
+
+
+/* ───────────── materials ───────────── */
+const matWhite = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.3, metalness: 0.0, clearcoat: 1, clearcoatRoughness: 0.12 });
+const matSatin = new THREE.MeshPhysicalMaterial({ color: 0xf2f2f2, roughness: 0.42, metalness: 0.05, clearcoat: 0.5, clearcoatRoughness: 0.3 });
+const matCut   = new THREE.MeshPhysicalMaterial({ color: 0xdfe3ea, roughness: 0.22, metalness: 0.1, clearcoat: 1, clearcoatRoughness: 0.08 });
+const matVoid  = new THREE.MeshStandardMaterial({ color: 0x050507, roughness: 0.25, metalness: 0.85 });
+
+/* ───────────── 2D geometry helpers ───────────── */
+function chaikin(pts, iters) {
+  let p = pts;
+  for (let k = 0; k < iters; k++) {
+    const out = [];
+    for (let i = 0; i < p.length; i++) {
+      const a = p[i], b = p[(i + 1) % p.length];
+      out.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25],
+               [a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]);
+    }
+    p = out;
+  }
+  return p;
+}
+function ringArea(r) {
+  let a = 0;
+  for (let i = 0; i < r.length; i++) { const p = r[i], q = r[(i + 1) % r.length]; a += p[0] * q[1] - q[0] * p[1]; }
+  return a / 2;
+}
+function pointInRing(x, y, r) {
+  let inside = false;
+  for (let i = 0, j = r.length - 1; i < r.length; j = i++) {
+    const xi = r[i][0], yi = r[i][1], xj = r[j][0], yj = r[j][1];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+function pointInPart(x, y, outer, holes) {
+  if (!pointInRing(x, y, outer)) return false;
+  for (const h of holes) if (pointInRing(x, y, h)) return false;
+  return true;
+}
+// Sutherland–Hodgman clip against the half-plane n·p <= c
+function clipHalfPlane(poly, nx, ny, c) {
+  const out = [];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const da = nx * a[0] + ny * a[1] - c, db = nx * b[0] + ny * b[1] - c;
+    if (da <= 0) out.push(a);
+    if ((da < 0 && db > 0) || (da > 0 && db < 0)) {
+      const t = da / (da - db);
+      out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+    }
+  }
+  return out;
+}
+
+/* Per-part look: zeros are smoothed, the 7 / bar / slide keep their hard corners. */
+const PART_CFG = [
+  { smooth: 3, holeSmooth: 2, depth: 0.62, bevT: 0.07, mat: matWhite, name: 'zero-a' },
+  { smooth: 3, holeSmooth: 2, depth: 0.62, bevT: 0.07, mat: matWhite, name: 'zero-b' },
+  { smooth: 0, holeSmooth: 0, depth: 0.56, bevT: 0.055, mat: matWhite, name: 'seven' },
+  { smooth: 0, holeSmooth: 0, depth: 0.34, bevT: 0.04, mat: matSatin, name: 'guard' },
+  { smooth: 0, holeSmooth: 0, depth: 0.56, bevT: 0.055, mat: matWhite, name: 'slide' },
+];
+const PREP = LOGO_PARTS.map((p, i) => {
+  const c = PART_CFG[i];
+  const outer = c.smooth ? chaikin(p.outer, c.smooth) : p.outer.slice();
+  const holes = (p.holes || []).map((h) => (c.holeSmooth ? chaikin(h, c.holeSmooth) : h.slice()));
+  return { outer, holes, cfg: c };
+});
+
+function extrudeRings(outer, holes, depth, bevT, bevSegs, crease) {
+  const shape = new THREE.Shape(outer.map((p) => new THREE.Vector2(p[0], p[1])));
+  for (const h of holes) shape.holes.push(new THREE.Path(h.map((p) => new THREE.Vector2(p[0], p[1]))));
+  const bevS = bevT * 0.7;
+  let g = new THREE.ExtrudeGeometry(shape, {
+    depth, bevelEnabled: true, bevelThickness: bevT, bevelSize: bevS, bevelOffset: -bevS,
+    bevelSegments: bevSegs, curveSegments: 1, steps: 1,
+  });
+  g.translate(0, 0, -depth / 2);
+  g = toCreasedNormals(g, crease);
+  return g;
+}
+
+/* centre the geometry on itself so the mesh can tumble about its own middle */
+function centred(geo) {
+  geo.computeBoundingBox();
+  const c = new THREE.Vector3(); geo.boundingBox.getCenter(c);
+  geo.translate(-c.x, -c.y, -c.z);
+  geo.computeBoundingSphere();
+  return c;
+}
+
+/* ───────────── fracture: Voronoi cells ∩ part outline ───────────── */
+function fracturePart(prep) {
+  if (!polyClip) return [];
+  const { outer, holes } = prep;
+  const area = Math.abs(ringArea(outer)) - holes.reduce((s, h) => s + Math.abs(ringArea(h)), 0);
+  const n = clamp(Math.round(area / 0.3), 5, 20);
+  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  for (const p of outer) { minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]); minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]); }
+
+  // dart-throwing for evenly spread seeds
+  const seeds = [];
+  let minD = Math.sqrt(area / n) * 0.8;
+  for (let tries = 0; seeds.length < n && tries < 4000; tries++) {
+    if (tries % 400 === 399) minD *= 0.85;
+    const x = rnd(minX, maxX), y = rnd(minY, maxY);
+    if (!pointInPart(x, y, outer, holes)) continue;
+    if (seeds.every((s) => Math.hypot(s[0] - x, s[1] - y) >= minD)) seeds.push([x, y]);
+  }
+  if (seeds.length < 2) return [];
+
+  const box = [[minX - 1, minY - 1], [maxX + 1, minY - 1], [maxX + 1, maxY + 1], [minX - 1, maxY + 1]];
+  const pieces = [];
+  for (let i = 0; i < seeds.length; i++) {
+    let cell = box;
+    const si = seeds[i];
+    for (let j = 0; j < seeds.length && cell.length > 2; j++) {
+      if (j === i) continue;
+      const sj = seeds[j];
+      const nx = sj[0] - si[0], ny = sj[1] - si[1];
+      const c = (nx * (si[0] + sj[0]) + ny * (si[1] + sj[1])) / 2;
+      cell = clipHalfPlane(cell, nx, ny, c);
+    }
+    if (cell.length < 3) continue;
+    let res;
+    try { res = polyClip.intersection([outer, ...holes], [cell]); } catch (e) { continue; }
+    for (const poly of res) {
+      const ring = poly[0].slice(0, -1);
+      if (ring.length < 3 || Math.abs(ringArea(ring)) < 0.02) continue;
+      pieces.push({ outer: ring, holes: poly.slice(1).map((h) => h.slice(0, -1)) });
+    }
+  }
+  return pieces;
+}
+
+/* ───────────── entities (anything that can fly off) ───────────── */
+const parts = [];
+const entities = [];
+const debris = new THREE.Group();   // world-space parent while flying
+scene.add(debris);
+
+function makeEntity(geo, mat, part, kind, opts = {}) {
+  const centre = centred(geo);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true; mesh.receiveShadow = true;
+  mesh.position.copy(centre);
+  if (opts.quat) mesh.quaternion.copy(opts.quat);
+  assembly.add(mesh);
+  const e = {
+    mesh, part, kind, mat,
+    restPos: mesh.position.clone(), restQuat: mesh.quaternion.clone(),
+    state: 'rest',               // rest | flying | settled | returning
+    vel: new THREE.Vector3(), ang: new THREE.Vector3(),
+    radius: geo.boundingSphere.radius,
+    delay: 0, t: 0, sleep: 0,
+    fromPos: new THREE.Vector3(), fromQuat: new THREE.Quaternion(), dur: 1,
+  };
+  mesh.userData.entity = e;
+  entities.push(e);
+  return e;
+}
+
+function makeSimplePart(name, geo, mat, pos, quat) {
+  const part = { name, whole: null, pieces: [], fractured: false };
+  const e = makeEntity(geo, mat, part, 'detail');
+  if (pos) { e.mesh.position.add(pos); e.restPos.copy(e.mesh.position); }
+  if (quat) { e.mesh.quaternion.copy(quat); e.restQuat.copy(quat); }
+  part.whole = e;
+  parts.push(part);
+  return part;
+}
+
+async function buildLogo() {
+  // 1. the five main parts, each as one crisp solid + a hidden set of pre-cut fragments
+  for (let i = 0; i < PREP.length; i++) {
+    const pr = PREP[i], c = pr.cfg;
+    const part = { name: c.name, whole: null, pieces: [], fractured: false };
+    part.whole = makeEntity(extrudeRings(pr.outer, pr.holes, c.depth, c.bevT, 5, 0.6), c.mat, part, 'whole');
+    parts.push(part);
+
+    for (const f of fracturePart(pr)) {
+      let g;
+      try { g = extrudeRings(f.outer, f.holes, c.depth, c.bevT * 0.6, 2, 0.5); } catch (e) { continue; }
+      const e = makeEntity(g, c.mat === matSatin ? matSatin : matCut, part, 'piece');
+      e.mesh.visible = false;
+      part.pieces.push(e);
+    }
+    elLoading.textContent = 'assembling ' + Math.round(((i + 1) / PREP.length) * 80) + '%';
+    await nextFrame();
+  }
+
+  // 2. mechanical details on the slide (all measured from the slide outline)
+  const sp = LOGO_PARTS[4].outer;
+  let topY = -1e9, tipX = -1e9;
+  for (const [x, y] of sp) { topY = Math.max(topY, y); tipX = Math.max(tipX, x); }
+  const slideCfg = PART_CFG[4];
+  const faceZ = slideCfg.depth / 2 + slideCfg.bevT;          // 0.335
+
+  // rear serrations: taller than the slide is thick so they stand proud on both faces
+  for (let i = 0; i < 6; i++) {
+    makeSimplePart('rib' + i, new RoundedBoxGeometry(0.034, 0.4, faceZ * 2 + 0.07, 2, 0.012), matWhite,
+      new THREE.Vector3(2.5 + i * 0.075, topY - 0.34, 0).sub(new THREE.Vector3(0, 0, 0)));
+  }
+  // ejection port: bezel + dark window, on both faces
+  for (const s of [1, -1]) {
+    const bez = makeSimplePart('bezel' + s, new RoundedBoxGeometry(0.7, 0.27, 0.014, 2, 0.006), matSatin,
+      new THREE.Vector3(3.55, topY - 0.3, s * (faceZ + 0.006)));
+    const win = makeSimplePart('window' + s, new RoundedBoxGeometry(0.58, 0.17, 0.008, 2, 0.003), matVoid,
+      new THREE.Vector3(3.55, topY - 0.3, s * (faceZ + 0.0125)));
+  }
+  // sights
+  makeSimplePart('frontSight', new RoundedBoxGeometry(0.13, 0.11, 0.09, 2, 0.02), matWhite, new THREE.Vector3(tipX - 0.2, topY + 0.045, 0));
+  for (const s of [1, -1]) {
+    makeSimplePart('rearSight' + s, new RoundedBoxGeometry(0.09, 0.1, 0.08, 2, 0.015), matWhite, new THREE.Vector3(2.7, topY + 0.045, s * 0.1));
+  }
+  // muzzle crown + bore
+  const crown = new THREE.CylinderGeometry(0.13, 0.13, 0.12, 32); crown.rotateZ(Math.PI / 2);
+  makeSimplePart('muzzle', crown, matSatin, new THREE.Vector3(tipX + 0.0, topY - 0.22, 0));
+  const bore = new THREE.CylinderGeometry(0.06, 0.06, 0.15, 24); bore.rotateZ(Math.PI / 2);
+  makeSimplePart('bore', bore, matVoid, new THREE.Vector3(tipX + 0.02, topY - 0.22, 0));
+
+  elLoading.textContent = 'assembling 100%';
+}
+
+/* ───────────── destruction & rebuild logic ───────────── */
+const BLAST_R = 1.3;
+const _v = new THREE.Vector3(), _w = new THREE.Vector3(), _q = new THREE.Quaternion(), _dq = new THREE.Quaternion();
+let integrityDirty = true;
+let brokenCount = 0;
+const fx = { shake: 0, pulse: 0 };       // filled in below (visual effects)
+let onBreakFx = () => {}, onRebuildFx = () => {}, onLandFx = () => {};
+
+function isPickable(e) { return e.state === 'rest' && e.mesh.visible; }
+
+function activateFracture(part) {
+  part.fractured = true;
+  part.whole.mesh.visible = false;
+  for (const p of part.pieces) p.mesh.visible = true;
+}
+
+function launch(e, hitLocal, strength) {
+  // world position of the piece before reparenting
+  e.mesh.getWorldPosition(_w);
+  debris.attach(e.mesh);
+  assembly.localToWorld(_v.copy(hitLocal));
+  const dir = _w.clone().sub(_v);
+  const d = dir.length();
+  if (d < 0.05) dir.set(rnd(-1, 1), rnd(-0.3, 1), rnd(0, 1));
+  dir.normalize();
+  const falloff = clamp(1.35 - d * 0.4, 0.45, 1.35) * strength;
+  const speed = rnd(3.2, 7.2) * falloff;
+  e.vel.copy(dir).multiplyScalar(speed);
+  e.vel.y += rnd(1.5, 4.2);
+  e.vel.z += rnd(0.5, 3.2);                 // bias toward the viewer so it reads in 3D
+  e.ang.set(rnd(-9, 9), rnd(-9, 9), rnd(-9, 9)).multiplyScalar(1 / (0.6 + e.radius * 0.5));
+  e.state = 'flying';
+  e.sleep = 0;
+  brokenCount++;
+  integrityDirty = true;
+}
+
+/** Break everything near `worldPoint`. Returns how many entities came loose. */
+function blastAt(worldPoint, hitEntity, strength = 1) {
+  const hit = assembly.worldToLocal(worldPoint.clone());
+  let loose = 0;
+  const box = new THREE.Box3();
+
+  for (const part of parts) {
+    if (part.pieces.length) {
+      // fracture the part the first time anything reaches it
+      if (!part.fractured) {
+        if (!part.whole.mesh.visible || part.whole.state !== 'rest') continue;
+        box.copy(part.whole.mesh.geometry.boundingBox).translate(part.whole.restPos);
+        if (box.distanceToPoint(hit) > BLAST_R && part.whole !== hitEntity) continue;
+        activateFracture(part);
+      }
+      let nearest = null, nearestD = 1e9, got = 0;
+      for (const p of part.pieces) {
+        if (p.state !== 'rest') continue;
+        const d = Math.max(0, p.restPos.distanceTo(hit) - p.radius * 0.6);
+        if (d < nearestD) { nearestD = d; nearest = p; }
+        if (d <= BLAST_R * 0.8 || p === hitEntity) { launch(p, hit, strength); loose++; got++; }
+      }
+      if (!got && nearest && nearestD <= BLAST_R) { launch(nearest, hit, strength); loose++; }
+    } else {
+      const w = part.whole;
+      if (!isPickable(w)) continue;
+      if (w === hitEntity || w.restPos.distanceTo(hit) - w.radius * 0.5 <= BLAST_R) { launch(w, hit, strength); loose++; }
+    }
+  }
+  if (loose) onBreakFx(worldPoint, loose, strength);
+  return loose;
+}
+
+function syncBrokenCount() {
+  let n = 0;
+  for (const e of entities) if (e.state === 'flying' || e.state === 'settled') n++;
+  brokenCount = n;
+}
+
+function rebuildAll() {
+  const list = entities.filter((e) => e.state === 'flying' || e.state === 'settled');
+  if (!list.length) return;
+  list.sort(() => Math.random() - 0.5);
+  list.forEach((e, i) => {
+    assembly.attach(e.mesh);
+    e.fromPos.copy(e.mesh.position);
+    e.fromQuat.copy(e.mesh.quaternion);
+    e.t = -Math.min(i * 0.012, 0.45) - rnd(0, 0.08);
+    e.dur = rnd(0.7, 1.05);
+    e.state = 'returning';
+  });
+  syncBrokenCount();
+  integrityDirty = true;
+  onRebuildFx(list.length);
+}
+
+function partSettled(part) {
+  if (!part.fractured) return;
+  if (part.pieces.every((p) => p.state === 'rest')) {
+    part.fractured = false;
+    part.whole.mesh.visible = true;
+    for (const p of part.pieces) p.mesh.visible = false;
+  }
+}
+
+/** Intro: everything flies in from scatter. */
+function scatterIn() {
+  for (const e of entities) {
+    if (e.kind === 'piece') continue;
+    e.fromPos.copy(e.restPos).multiplyScalar(1.5).add(_v.set(rnd(-5, 5), rnd(-3, 5), rnd(6, 16)));
+    e.fromQuat.setFromEuler(new THREE.Euler(rnd(-3, 3), rnd(-3, 3), rnd(-3, 3)));
+    e.mesh.position.copy(e.fromPos);
+    e.mesh.quaternion.copy(e.fromQuat);
+    e.t = -(0.25 + (e.restPos.x + 5) * 0.045 + rnd(0, 0.25));
+    e.dur = rnd(1.1, 1.5);
+    e.state = 'returning';
+  }
+}
+
+/* ───────────── per-frame physics ───────────── */
+let landSoundBudget = 0;
+function stepEntities(dt) {
+  for (const e of entities) {
+    const m = e.mesh;
+    if (e.state === 'flying') {
+      e.vel.y -= GRAV * dt;
+      e.vel.multiplyScalar(1 - 0.18 * dt);
+      m.position.addScaledVector(e.vel, dt);
+      const w = e.ang.length();
+      if (w > 1e-4) { _dq.setFromAxisAngle(_v.copy(e.ang).divideScalar(w), w * dt); m.quaternion.premultiply(_dq); }
+
+      const r = clamp(e.radius * 0.3, 0.07, 0.35);
+      if (m.position.y - r < FLOOR) {
+        m.position.y = FLOOR + r;
+        const impact = -e.vel.y;
+        if (impact > 0) {
+          e.vel.y = impact * 0.3;
+          e.vel.x *= 0.78; e.vel.z *= 0.78;
+          e.ang.multiplyScalar(0.55);
+          if (impact > 2.5) onLandFx(m.position, impact, e.radius);
+        }
+        if (impact < 1.4 && e.vel.lengthSq() < 0.5) { e.state = 'settled'; e.vel.set(0, 0, 0); e.ang.set(0, 0, 0); }
+      }
+      if (Math.abs(m.position.x) > WALL_X) { m.position.x = Math.sign(m.position.x) * WALL_X; e.vel.x *= -0.4; }
+      if (m.position.z > 7)  { m.position.z = 7;  e.vel.z *= -0.4; }
+      if (m.position.z < -6) { m.position.z = -6; e.vel.z *= -0.4; }
+    } else if (e.state === 'returning') {
+      e.t += dt;
+      if (e.t < 0) continue;
+      const u = clamp(e.t / e.dur, 0, 1);
+      const k = easeInOutCubic(u);
+      m.position.lerpVectors(e.fromPos, e.restPos, k);
+      m.position.z += Math.sin(Math.PI * u) * 0.9;       // little arc so parts don't clip through each other
+      m.quaternion.slerpQuaternions(e.fromQuat, e.restQuat, easeOutQuart(u));
+      if (u >= 1) {
+        m.position.copy(e.restPos);
+        m.quaternion.copy(e.restQuat);
+        e.state = 'rest';
+        integrityDirty = true;
+        partSettled(e.part);
+        fx.pulse = Math.min(fx.pulse + 0.05, 0.4);
+      }
+    }
+  }
+}
+
+/** 0–1 how much of the logo is still in place (area weighted). */
+function computeIntegrity() {
+  let sum = 0, tot = 0;
+  for (const part of parts) {
+    const weight = part.whole.radius * part.whole.radius;
+    if (part.pieces.length) {
+      let w = 0, a = 0;
+      for (const p of part.pieces) { const r2 = p.radius * p.radius; w += r2; if (p.state === 'rest') a += r2; }
+      const frac = part.fractured ? (w ? a / w : 1) : 1;
+      sum += frac * weight;
+      tot += weight;
+    } else {
+      sum += (part.whole.state === 'rest' ? 1 : 0) * weight;
+      tot += weight;
+    }
+  }
+  return tot ? sum / tot : 1;
+}
+
+/* ───────────── audio (synthesised, no files) ───────────── */
+let actx = null, master = null, noiseBuf = null, soundOn = true, lastCrack = 0, lastTink = 0;
+try { soundOn = localStorage.getItem('007-sound') !== 'off'; } catch (e) {}
+function syncSoundBtn() { btnSnd.setAttribute('aria-pressed', String(soundOn)); }
+syncSoundBtn();
+
+function ensureAudio() {
+  if (!actx) {
+    try {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      master = actx.createGain(); master.gain.value = 0.55; master.connect(actx.destination);
+      noiseBuf = actx.createBuffer(1, actx.sampleRate * 0.6, actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    } catch (e) { actx = null; return false; }
+  }
+  if (actx.state === 'suspended') actx.resume().catch(() => {});
+  return true;
+}
+function env(g, t, peak, attack, decay) {
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+}
+function sndCrack(power) {
+  if (!soundOn || !actx) return;
+  const t = actx.currentTime;
+  if (t - lastCrack < 0.045) return;
+  lastCrack = t;
+  const src = actx.createBufferSource(); src.buffer = noiseBuf;
+  const bp = actx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = rnd(1400, 4200); bp.Q.value = 0.9;
+  const g = actx.createGain(); env(g, t, 0.32 * clamp(power, 0.3, 1.2), 0.004, rnd(0.09, 0.18));
+  src.connect(bp); bp.connect(g); g.connect(master); src.start(t, rnd(0, 0.3), 0.3);
+  const o = actx.createOscillator(); o.type = 'sine'; o.frequency.setValueAtTime(150, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.16);
+  const og = actx.createGain(); env(og, t, 0.38 * clamp(power, 0.3, 1.2), 0.003, 0.17);
+  o.connect(og); og.connect(master); o.start(t); o.stop(t + 0.25);
+}
+function sndTink(v) {
+  if (!soundOn || !actx) return;
+  const t = actx.currentTime;
+  if (t - lastTink < 0.03) return;
+  lastTink = t;
+  const o = actx.createOscillator(); o.type = 'triangle'; o.frequency.value = rnd(1800, 4200);
+  const g = actx.createGain(); env(g, t, clamp(v / 14, 0.02, 0.1), 0.001, rnd(0.04, 0.09));
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + 0.15);
+}
+function sndRebuild() {
+  if (!soundOn || !actx) return;
+  const t = actx.currentTime;
+  const o = actx.createOscillator(); o.type = 'sawtooth';
+  o.frequency.setValueAtTime(110, t); o.frequency.exponentialRampToValueAtTime(880, t + 0.85);
+  const f = actx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.setValueAtTime(300, t); f.frequency.exponentialRampToValueAtTime(5000, t + 0.85);
+  const g = actx.createGain(); env(g, t, 0.09, 0.2, 0.7);
+  o.connect(f); f.connect(g); g.connect(master); o.start(t); o.stop(t + 1.1);
+  const c = actx.createOscillator(); c.type = 'sine'; c.frequency.value = 1320;
+  const cg = actx.createGain(); env(cg, t + 0.95, 0.08, 0.004, 0.35);
+  c.connect(cg); cg.connect(master); c.start(t + 0.95); c.stop(t + 1.4);
+}
+
+/* ───────────── visual effects ───────────── */
+// shockwave rings
+const rings = [];
+{
+  const g = new THREE.RingGeometry(0.9, 1, 64);
+  for (let i = 0; i < 8; i++) {
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide }));
+    m.visible = false; m.renderOrder = 5; scene.add(m);
+    rings.push({ m, t: 1, max: 3 });
+  }
+}
+let ringIdx = 0;
+function spawnRing(p, size) {
+  const r = rings[ringIdx++ % rings.length];
+  r.m.position.copy(p); r.m.quaternion.copy(camera.quaternion);
+  r.t = 0; r.max = size; r.m.visible = true;
+}
+
+// instanced glass shards
+const SHARDS = coarse ? 260 : 520;
+const shardMesh = new THREE.InstancedMesh(new THREE.TetrahedronGeometry(0.1, 0), matWhite, SHARDS);
+shardMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+shardMesh.castShadow = true; shardMesh.frustumCulled = false;
+scene.add(shardMesh);
+const shard = Array.from({ length: SHARDS }, () => ({ p: new THREE.Vector3(), v: new THREE.Vector3(), r: new THREE.Euler(), rv: new THREE.Vector3(), s: 0, life: 0, max: 1 }));
+const dummy = new THREE.Object3D();
+{ dummy.scale.setScalar(0); dummy.updateMatrix(); for (let i = 0; i < SHARDS; i++) { shardMesh.setMatrixAt(i, dummy.matrix); shard[i].s = 0; } }  // park every instance at scale 0 until used
+let shardCursor = 0;
+function spawnShards(p, n, power) {
+  for (let i = 0; i < n; i++) {
+    const s = shard[shardCursor++ % SHARDS];
+    s.p.copy(p).add(_v.set(rnd(-0.25, 0.25), rnd(-0.25, 0.25), rnd(-0.25, 0.25)));
+    s.v.set(rnd(-1, 1), rnd(-0.4, 1.2), rnd(-0.4, 1.3)).normalize().multiplyScalar(rnd(2.5, 9) * power);
+    s.rv.set(rnd(-16, 16), rnd(-16, 16), rnd(-16, 16));
+    s.r.set(rnd(0, 6), rnd(0, 6), rnd(0, 6));
+    s.s = rnd(0.35, 1.3); s.max = rnd(1.8, 3.4); s.life = s.max;
+  }
+}
+function stepShards(dt) {
+  for (let i = 0; i < SHARDS; i++) {
+    const s = shard[i];
+    if (s.life <= 0) { if (s.s !== 0) { s.s = 0; dummy.scale.setScalar(0); dummy.updateMatrix(); shardMesh.setMatrixAt(i, dummy.matrix); } continue; }
+    s.life -= dt;
+    s.v.y -= GRAV * 0.8 * dt;
+    s.p.addScaledVector(s.v, dt);
+    if (s.p.y < FLOOR + 0.05) { s.p.y = FLOOR + 0.05; s.v.y *= -0.3; s.v.x *= 0.7; s.v.z *= 0.7; s.rv.multiplyScalar(0.5); }
+    s.r.x += s.rv.x * dt; s.r.y += s.rv.y * dt; s.r.z += s.rv.z * dt;
+    dummy.position.copy(s.p); dummy.rotation.copy(s.r);
+    dummy.scale.setScalar(s.s * clamp(s.life / 0.6, 0, 1));
+    dummy.updateMatrix(); shardMesh.setMatrixAt(i, dummy.matrix);
+  }
+  shardMesh.instanceMatrix.needsUpdate = true;
+}
+
+// ambient dust
+const dust = (() => {
+  const n = coarse ? 90 : 180, pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { pos[i * 3] = rnd(-12, 12); pos[i * 3 + 1] = rnd(-3, 7); pos[i * 3 + 2] = rnd(-8, 6); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const pts = new THREE.Points(g, new THREE.PointsMaterial({ color: 0xffffff, size: 0.035, transparent: true, opacity: 0.35, depthWrite: false, sizeAttenuation: true }));
+  pts.frustumCulled = false; scene.add(pts); return pts;
+})();
+
+onBreakFx = (p, loose, strength) => {
+  spawnShards(p, Math.min(8 + loose * 3, 36), strength);
+  spawnRing(p, 2.2 + Math.min(loose, 8) * 0.18);
+  fx.shake = Math.min(fx.shake + 0.035 + loose * 0.006, 0.22);
+  fx.pulse = Math.min(fx.pulse + 0.1, 0.4);
+  sndCrack(0.5 + loose * 0.08);
+  if (navigator.vibrate && coarse) { try { navigator.vibrate(8); } catch (e) {} }
+};
+onRebuildFx = () => { fx.pulse = 0.5; sndRebuild(); };
+onLandFx = (p, impact, r) => { sndTink(impact * (0.5 + r)); };
+
+/* ───────────── UI ───────────── */
+let lastIntegrity = -1;
+function updateIntegrityUI() {
+  const v = computeIntegrity();
+  const pct = Math.round(v * 100);
+  if (pct !== lastIntegrity) {
+    lastIntegrity = pct;
+    elIntegrity.textContent = 'integrity ' + pct + '%';
+    elBarFill.style.transform = 'scaleX(' + v.toFixed(3) + ')';
+    btnRebuild.disabled = brokenCount === 0 && pct === 100;
+  }
+}
+
+/* ───────────── input ───────────── */
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+function pick(x, y) {
+  ndc.set((x / window.innerWidth) * 2 - 1, -(y / window.innerHeight) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const targets = [];
+  for (const e of entities) if (isPickable(e)) targets.push(e.mesh);
+  const hits = raycaster.intersectObjects(targets, false);
+  return hits.length ? hits[0] : null;
+}
+function smash(x, y, strength) {
+  const hit = pick(x, y);
+  if (!hit) return false;
+  const loose = blastAt(hit.point, hit.object.userData.entity, strength);
+  if (loose) { elHint.classList.remove('show'); btnRebuild.disabled = false; }
+  return loose > 0;
+}
+
+let smashing = false, activeId = -1, downX = 0, downY = 0, downT = 0, lastX = 0, lastY = 0, userOrbiting = false;
+const cv = renderer.domElement;
+// capture phase: runs before OrbitControls, so we can claim the gesture by disabling it first
+cv.addEventListener('pointerdown', (e) => {
+  ensureAudio();
+  if (!e.isPrimary) { smashing = false; controls.enabled = true; return; }
+  activeId = e.pointerId; downX = lastX = e.clientX; downY = lastY = e.clientY; downT = performance.now();
+  if (pick(e.clientX, e.clientY)) {
+    smashing = true; controls.enabled = false;
+    try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+    smash(e.clientX, e.clientY, 1);
+  } else { smashing = false; controls.enabled = true; }
+}, true);
+cv.addEventListener('pointermove', (e) => {
+  if (!smashing || e.pointerId !== activeId) return;
+  // sample along the stroke so fast swipes can't skip over parts
+  const dx = e.clientX - lastX, dy = e.clientY - lastY, steps = clamp(Math.ceil(Math.hypot(dx, dy) / 14), 1, 8);
+  for (let i = 1; i <= steps; i++) smash(lastX + (dx * i) / steps, lastY + (dy * i) / steps, 0.85);
+  lastX = e.clientX; lastY = e.clientY;
+});
+function endPointer(e, cancelled) {
+  if (e.pointerId !== activeId) return;
+  if (!smashing && !cancelled) {
+    const moved = Math.hypot(e.clientX - downX, e.clientY - downY), dt = performance.now() - downT;
+    if (moved < 10 && dt < 350 && brokenCount > 0) rebuildAll();
+  }
+  smashing = false; controls.enabled = true; activeId = -1;
+}
+cv.addEventListener('pointerup', (e) => endPointer(e, false));
+cv.addEventListener('pointercancel', (e) => endPointer(e, true));
+controls.addEventListener('start', () => { userOrbiting = true; });
+controls.addEventListener('end', () => { userOrbiting = false; });
+
+btnRebuild.addEventListener('click', () => { ensureAudio(); rebuildAll(); });
+btnSnd.addEventListener('click', () => {
+  soundOn = !soundOn; syncSoundBtn(); if (soundOn) ensureAudio();
+  try { localStorage.setItem('007-sound', soundOn ? 'on' : 'off'); } catch (e) {}
+});
+addEventListener('keydown', (e) => {
+  if (e.repeat || e.metaKey || e.ctrlKey) return;
+  if (e.key === 'r' || e.key === 'R') { rebuildAll(); }
+  else if (e.key === 'm' || e.key === 'M') { btnSnd.click(); }
+  else if (e.key === 'h' || e.key === 'H') { document.body.classList.toggle('hud-off'); }
+});
+
+/* ───────────── resize / adaptive quality ───────────── */
+let resizeQueued = false;
+function applySize() {
+  resizeQueued = false;
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setPixelRatio(quality);
+  renderer.setSize(w, h);
+  composer.setPixelRatio(quality);
+  composer.setSize(w, h);
+  applyResponsiveCamera(true);
+}
+function onResize() { if (!resizeQueued) { resizeQueued = true; requestAnimationFrame(applySize); } }
+addEventListener('resize', onResize);
+addEventListener('orientationchange', () => setTimeout(onResize, 120));
+
+let slowFrames = 0, lastDowngrade = 0;
+function watchPerformance(rawDt, now) {
+  if (document.hidden) return;
+  slowFrames = rawDt > 0.034 ? slowFrames + 1 : Math.max(0, slowFrames - 2);
+  if (slowFrames > 70 && quality > 1 && now - lastDowngrade > 2500) {
+    quality = Math.max(1, quality * 0.8); slowFrames = 0; lastDowngrade = now; onResize();
+  }
+}
+
+/* ───────────── main loop ───────────── */
+const clock = new THREE.Clock();
+let swayK = 1, time = 0, bloomBase = 0.12;
+function frame() {
+  requestAnimationFrame(frame);
+  const rawDt = clock.getDelta();
+  const dt = Math.min(rawDt, 0.05);
+  time += dt;
+  watchPerformance(rawDt, performance.now());
+
+  // calm idle motion; fades out while orbiting, smashing, or rebuilding (and disabled under reduced-motion)
+  const returning = entities.some((e) => e.state === 'returning');
+  if (reduceMotion) {
+    assembly.position.set(0, 0, 0);
+    assembly.rotation.set(0, 0, 0);
+    fx.shake = 0;
+    fx.pulse = 0;
+    bloom.strength = bloomBase;
+  } else {
+    swayK += (((userOrbiting || smashing || returning) ? 0 : 1) - swayK) * (1 - Math.pow(0.02, dt));
+    const shake = fx.shake;
+    assembly.position.set(rnd(-1, 1) * shake, Math.sin(time * 1.6) * 0.06 * swayK + rnd(-1, 1) * shake, 0);
+    assembly.rotation.set(Math.cos(time * 1.3) * 0.012 * swayK, Math.sin(time * 0.42) * 0.24 * swayK, Math.sin(time) * 0.01 * swayK);
+    fx.shake *= Math.pow(0.002, dt);
+    fx.pulse *= Math.pow(0.03, dt);
+    bloom.strength = bloomBase + fx.pulse;
+  }
+
+  // slow-drifting light for living reflections
+  keyLight.position.x = 6 + Math.sin(time * 0.35) * 2.5;
+  rimL.position.y = 6 + Math.sin(time * 0.5) * 2;
+
+  stepEntities(dt);
+  stepShards(dt);
+  for (const r of rings) {
+    if (r.t >= 1) { if (r.m.visible) r.m.visible = false; continue; }
+    r.t = Math.min(1, r.t + dt / 0.55);
+    const k = easeOutQuart(r.t);
+    r.m.scale.setScalar(0.2 + k * r.max);
+    r.m.material.opacity = (1 - r.t) * 0.55;
+  }
+  dust.rotation.y += dt * 0.012;
+  dust.position.y = Math.sin(time * 0.2) * 0.2;
+
+  if (integrityDirty) { integrityDirty = false; updateIntegrityUI(); }
+  controls.update();
+  composer.render();
+}
+
+/* ───────────── boot ───────────── */
+try {
+  await buildLogo();
+} catch (err) {
+  console.error(err);
+  fatal('could not build the logo — see console');
+}
+if (!reduceMotion) scatterIn();
+updateIntegrityUI();
+elLoading.classList.add('hide');
+setTimeout(() => { if (brokenCount === 0) elHint.classList.add('show'); }, reduceMotion ? 300 : 2600);
+setTimeout(() => elHint.classList.remove('show'), 12000);
+frame();
+
+// tiny debug/test surface
+window.__007 = { entities, parts, scene, camera, blastAt, rebuildAll, pick, computeIntegrity, stepEntities, get broken() { return brokenCount; }, fracturing: !!polyClip };
+</script>
+</body>
+</html>
